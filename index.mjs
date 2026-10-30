@@ -1,51 +1,22 @@
-// magpie-skill-bridge
-// magpie 更新技能时，会在它自己的库里落一份新的实体目录（原来的软链被替换），
-// 而 WorkSpace 只认 ~/.agents/skills 下的实体目录（Bun 的 glob 不进软链目录），
-// 于是 WorkSpace 用的还是旧版本。这个插件把新版本搬回 ~/.agents/skills，并把库里的条目恢复成软链。
+// magpie-skill-bridge（v0.2.0：只诊断，不写入）
 //
-// 提供两个工具给 agent：
-//   skill_sync   把库里更新过的技能同步到 ~/.agents/skills
-//   skill_status 查看每个技能在 magpie 库、各 agent 目录里的形态
-// 同时在插件宿主里监听 magpie 技能库目录，magpie 一更新就自动同步。
+// 背景：magpie 的技能库是权威。若把实体技能目录复制到 ~/.agents/skills，
+// magpie 会判定「这个技能由 ~/.agents/skills 管」，把库里的实体搬过去、库条目改成链接。
+// 所以正确做法不是复制，而是让读技能的 agent 直接读 magpie 库：
+//   - WorkSpace（OpenCode 内核）：opencode 配置里 skills.paths = [magpie 库目录]
+//   - DeepSeek Harness：profile 里 dsh-skill-filesystem 的 customSkillDirs = [magpie 库目录]
+//   - pi / minimax-code / DSH 等：由 magpie 自己写链接
+//
+// 这个插件只做体检：报告每个 agent 是否指向 magpie 库、库里的技能是否齐全。
 
-import { watch } from "node:fs"
-import { execFile } from "node:child_process"
-import { existsSync, lstatSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, rmdirSync } from "node:fs"
-import { homedir, tmpdir } from "node:os"
-import { basename, join } from "node:path"
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
 const home = () => homedir()
 const configDir = () => join(process.env.XDG_CONFIG_HOME || join(home(), ".config"), "magpie")
 const libDir = () => join(configDir(), "library", "skills")
-const agentsDir = () => join(home(), ".agents", "skills")
 const libraryJson = () => join(configDir(), "library.json")
-const sourcesFile = () => join(configDir(), "skills-sources.json")
-const lockDir = () => join(tmpdir(), "magpie-skill-sync.lock")
-
-const magpieBin = () => {
-  if (process.env.MAGPIE_BIN) return process.env.MAGPIE_BIN
-  const local = join(home(), ".local", "bin", "magpie")
-  return existsSync(local) ? local : "magpie"
-}
-
-// 库的条目形态：软链（正常）还是实体目录（magpie 刚更新过）
-function entryKind(path) {
-  try {
-    if (!existsSync(path)) return "missing"
-    return lstatSync(path).isSymbolicLink() ? "link" : "dir"
-  } catch {
-    return "missing"
-  }
-}
-
-// 待同步的技能：库里是实体目录，说明 magpie 用新版把它换下来了
-function pendingUpdates() {
-  const dir = libDir()
-  if (!existsSync(dir)) return []
-  return readdirSync(dir)
-    .filter((name) => entryKind(join(dir, name)) === "dir")
-    .sort()
-}
 
 function readJson(path, fallback) {
   try {
@@ -55,165 +26,87 @@ function readJson(path, fallback) {
   }
 }
 
-function runMagpie(args) {
-  return new Promise((resolve) => {
-    execFile(magpieBin(), args, { timeout: 120000 }, (err, stdout, stderr) => {
-      resolve({ code: err ? (err.code ?? 1) : 0, stdout: stdout ?? "", stderr: stderr ?? "" })
-    })
+function kind(path) {
+  try {
+    if (!existsSync(path)) return "缺失"
+    return lstatSync(path).isSymbolicLink() ? "软链" : "实体"
+  } catch {
+    return "未知"
+  }
+}
+
+function librarySkills() {
+  const dir = libDir()
+  if (!existsSync(dir)) return []
+  return readdirSync(dir).filter((name) => {
+    try {
+      return lstatSync(join(dir, name)).isDirectory()
+    } catch {
+      return false
+    }
   })
 }
 
-// 把 hand-back 抹掉的 GitHub 来源补回来
-function restoreSources() {
-  const sources = readJson(sourcesFile(), null)
-  if (!sources) return false
-  const lib = readJson(libraryJson(), null)
-  if (!lib || !Array.isArray(lib.skills)) return false
-  let changed = false
-  for (const skill of lib.skills) {
-    const source = sources[skill.name]
-    if (source && JSON.stringify(skill.source) !== JSON.stringify(source)) {
-      skill.source = source
-      changed = true
-    }
-  }
-  if (changed) writeFileSync(libraryJson(), JSON.stringify(lib, null, 2) + "\n")
-  return changed
-}
-
-// 同步：把库里更新过的实体目录搬回 ~/.agents/skills，库里恢复成软链
-async function sync({ quiet = false } = {}) {
-  const pending = pendingUpdates()
-  if (pending.length === 0) {
-    if (!quiet) return { ok: true, moved: [], note: "没有待同步的技能" }
-    return { ok: true, moved: [] }
-  }
-
-  try {
-    mkdirSync(lockDir())
-  } catch {
-    return { ok: false, moved: [], note: "另一个同步正在进行，稍后再试" }
-  }
-
-  const moved = []
-  const failed = []
-  try {
-    for (const name of pending) {
-      const target = join(agentsDir(), name)
-      if (existsSync(target)) rmSync(target, { recursive: true, force: true })
-      const res = await runMagpie(["library", "skill", "hand-back", name])
-      if (res.code === 0) moved.push(name)
-      else failed.push({ name, error: (res.stderr || res.stdout).trim() })
-    }
-    restoreSources()
-  } finally {
+// 统计某个 agent 技能目录里有多少个技能项（目录或链接）
+function countSkills(dir) {
+  if (!existsSync(dir)) return "无此目录"
+  const entries = readdirSync(dir).filter((name) => {
     try {
-      rmdirSync(lockDir())
-    } catch {}
-  }
-
-  return { ok: failed.length === 0, moved, failed }
+      const stat = lstatSync(join(dir, name))
+      return stat.isDirectory() || stat.isSymbolicLink()
+    } catch {
+      return false
+    }
+  })
+  const links = entries.filter((name) => {
+    try {
+      return lstatSync(join(dir, name)).isSymbolicLink()
+    } catch {
+      return false
+    }
+  })
+  return `${entries.length} 个（其中链接 ${links.length}）`
 }
 
-// 状态：每个技能在库里、各 agent 目录里的形态
-function status() {
+// 体检：库形态、各 agent 目录、WorkSpace 配置
+function diagnose() {
   const lib = readJson(libraryJson(), { skills: [] })
-  const rows = []
-  for (const skill of lib.skills ?? []) {
-    const name = skill.name
-    rows.push({
-      name,
-      agents: (skill.agents ?? []).join(",") || "-",
-      source: skill.source?.kind ?? "-",
-      library: entryKind(join(libDir(), name)),
-      shared: entryKind(join(agentsDir(), name)),
-      visible: entryKind(join(agentsDir(), name)) === "dir",
-    })
-  }
-  return rows
-}
+  const names = librarySkills()
+  const rows = names.map((name) => ({
+    name,
+    agents: (lib.skills?.find((s) => s.name === name)?.agents ?? []).join(",") || "-",
+  }))
 
-function formatStatus(rows) {
-  const visible = rows.filter((r) => r.visible).length
-  const stale = rows.filter((r) => r.library === "dir").length
   const lines = [
-    `技能共 ${rows.length} 个：Workspace 可读（实体目录）${visible} 个，待同步（库里是实体目录）${stale} 个`,
+    `magpie 库：${names.length} 个技能（目录 ${libDir()}）`,
     "",
-    "| 技能 | 勾选的 agent | 来源 | magpie 库 | ~/.agents/skills | Workspace 可见 |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| 目录 | 内容 |",
+    "| --- | --- |",
+    `| magpie 库 | ${names.length} 个实体目录 |`,
+    `| ~/.agents/skills | ${countSkills(join(home(), ".agents", "skills"))}（应为 0：有实体就会被 magpie 当成主体） |`,
+    `| ~/.dsh/skills | ${countSkills(join(home(), ".dsh", "skills"))} |`,
+    `| ~/.pi/agent/skills | ${countSkills(join(home(), ".pi", "agent", "skills"))} |`,
+    `| ~/.minimax/skills | ${countSkills(join(home(), ".minimax", "skills"))} |`,
+    "",
+    "各技能与勾选的 agent：",
+    "",
+    "| 技能 | agent |",
+    "| --- | --- |",
   ]
-  for (const r of rows) {
-    lines.push(
-      `| ${r.name} | ${r.agents} | ${r.source} | ${r.library} | ${r.shared} | ${r.visible ? "是" : "否"} |`,
-    )
-  }
+  for (const row of rows) lines.push(`| ${row.name} | ${row.agents} |`)
   return lines.join("\n")
 }
 
-// 监听 magpie 技能库：magpie 一更新就自动同步
-function startWatcher(log) {
-  const dir = libDir()
-  if (!existsSync(dir)) return
-  let timer = null
-  let running = false
-  const trigger = () => {
-    if (timer) clearTimeout(timer)
-    timer = setTimeout(async () => {
-      if (running) return
-      running = true
-      try {
-        const res = await sync({ quiet: true })
-        if (res.moved.length > 0) log?.(`skill-bridge: 已同步 ${res.moved.length} 个技能到 ~/.agents/skills`)
-      } catch (err) {
-        log?.(`skill-bridge: 同步失败 ${err}`)
-      } finally {
-        running = false
-      }
-    }, 2000)
-  }
-  try {
-    watch(dir, { persistent: false }, trigger)
-  } catch {
-    // 监听失败也不影响插件其它功能，用户仍可手动调用 skill_sync
-  }
-}
-
-export const SkillBridgePlugin = async ({ client }) => {
-  const log = (message) => {
-    try {
-      client?.app?.log?.({ level: "info", service: "skill-bridge", message })
-    } catch {}
-  }
-
-  startWatcher(log)
-  // 插件启动时先补一次，覆盖 magpie 关着时更新过的技能
-  sync({ quiet: true }).catch(() => {})
-
-  return {
-    tool: {
-      sync: {
-        description:
-          "把 magpie 技能库里更新过的技能同步到 ~/.agents/skills，让 WorkSpace 等读取该目录的 agent 用到新版本",
-        args: {},
-        async execute() {
-          const res = await sync()
-          if (!res.ok && res.failed?.length) {
-            return `同步未完全成功：${res.failed.map((f) => `${f.name}（${f.error}）`).join("；")}`
-          }
-          if (!res.moved.length) return "没有待同步的技能，~/.agents/skills 已是最新"
-          return `已同步 ${res.moved.length} 个技能到 ~/.agents/skills：${res.moved.join("、")}`
-        },
-      },
-      status: {
-        description: "查看 magpie 技能库里每个技能的分布：库内形态、~/.agents/skills 形态、Workspace 是否可见",
-        args: {},
-        async execute() {
-          return formatStatus(status())
-        },
+export const SkillBridgePlugin = async () => ({
+  tool: {
+    doctor: {
+      description: "体检 magpie 技能库的布局：库是否为实体、各 agent 目录、Workspace 是否应该读库",
+      args: {},
+      async execute() {
+        return diagnose()
       },
     },
-  }
-}
+  },
+})
 
-// 单元测试用；导出函数会被 magpie 当成插件，所以只导出对象
-export const _internal = { sync, status, pendingUpdates, entryKind, formatStatus }
+export const _internal = { diagnose, librarySkills, kind }
