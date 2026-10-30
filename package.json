@@ -1,0 +1,31 @@
+{
+  "name": "magpie-skill-bridge",
+  "version": "0.1.0",
+  "description": "把 magpie 技能库里更新过的技能同步到 ~/.agents/skills，让 WorkSpace 等读取该目录的 agent 也能用",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "skills",
+    "agents"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sonny9527/magpie-skill-bridge.git"
+  },
+  "homepage": "https://github.com/Sonny9527/magpie-skill-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/Sonny9527/magpie-skill-bridge/issues"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%2312151b%22%2F%3E%3Cpath%20d%3D%22M14%2044c0-11%208-18%2018-18s18%207%2018%2018%22%20fill%3D%22none%22%20stroke%3D%22%236ea8fe%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%2F%3E%3Cpath%20d%3D%22M14%2044h36%22%20stroke%3D%22%233ddc97%22%20stroke-width%3D%225%22%20stroke-linecap%3D%22round%22%2F%3E%3Ccircle%20cx%3D%2214%22%20cy%3D%2244%22%20r%3D%225%22%20fill%3D%22%236ea8fe%22%2F%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2244%22%20r%3D%225%22%20fill%3D%22%233ddc97%22%2F%3E%3C%2Fsvg%3E"
+  }
+}
